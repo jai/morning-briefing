@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -126,6 +127,27 @@ type GogCalendarEvent struct {
 }
 
 func main() {
+	// Parse CLI flags
+	morningFlag := flag.Bool("morning", false, "Run morning briefing (default)")
+	eveningFlag := flag.Bool("evening", false, "Run evening wrap-up")
+	flag.Parse()
+
+	mode, err := ParseMode(*morningFlag, *eveningFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if mode == "evening" {
+		RunEveningBriefing()
+		return
+	}
+
+	// Default: morning briefing
+	RunMorningBriefing()
+}
+
+func RunMorningBriefing() {
 	now := time.Now()
 	today := now.Format("2006-01-02")
 	
