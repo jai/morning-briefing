@@ -1,0 +1,14 @@
+# Binary
+morning-briefing
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test coverage
+coverage.out
