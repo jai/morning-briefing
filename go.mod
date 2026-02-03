@@ -1,3 +1,3 @@
-module github.com/jaigovindani/morning-briefing
+module github.com/jai/morning-briefing
 
 go 1.22.2

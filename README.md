@@ -92,7 +92,7 @@ go build -o morning-briefing
 
 The following CLI tools must be available in PATH:
 
-- `health-ingest` - Apple Health data via [health-ingest](https://github.com/jaigovindani/health-ingest)
+- `health-ingest` - Apple Health data via [health-ingest](https://github.com/jai/health-ingest)
 - `gog` - Google Calendar CLI
 - `td` - Todoist CLI
 - `mcporter` - MCP client for Hevy integration
@@ -100,13 +100,13 @@ The following CLI tools must be available in PATH:
 ## Installation
 
 ```bash
-go install github.com/jaigovindani/morning-briefing@latest
+go install github.com/jai/morning-briefing@latest
 ```
 
 Or build from source:
 
 ```bash
-git clone https://github.com/jaigovindani/morning-briefing.git
+git clone https://github.com/jai/morning-briefing.git
 cd morning-briefing
 go build -o morning-briefing
 ```
