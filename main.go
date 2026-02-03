@@ -1,11 +1,16 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 // Output structure for LLM consumption
@@ -40,15 +45,17 @@ type SleepData struct {
 	TotalHours    *float64 `json:"total_hours,omitempty"`
 	DeepHours     *float64 `json:"deep_hours,omitempty"`
 	REMHours      *float64 `json:"rem_hours,omitempty"`
+	CoreHours     *float64 `json:"core_hours,omitempty"`
 	DataDate      string   `json:"data_date,omitempty"`
 	IsCurrentDay  bool     `json:"is_current_day"`
 	DataAvailable bool     `json:"data_available"`
 }
 
 type VitalsData struct {
-	RestingHR *float64 `json:"resting_hr_bpm,omitempty"`
-	HRV       *float64 `json:"hrv_ms,omitempty"`
-	SpO2      *float64 `json:"spo2_pct,omitempty"`
+	RestingHR       *float64 `json:"resting_hr_bpm,omitempty"`
+	HRV             *float64 `json:"hrv_ms,omitempty"`
+	SpO2            *float64 `json:"spo2_pct,omitempty"`
+	RespiratoryRate *float64 `json:"respiratory_rate,omitempty"`
 }
 
 type CalendarData struct {
@@ -77,9 +84,10 @@ type MedTask struct {
 }
 
 type Classification struct {
-	SleepQuality    string `json:"sleep_quality"`    // GOOD, OK, POOR, UNKNOWN
-	MorningLoad     string `json:"morning_load"`     // CLEAR, LIGHT, PACKED
-	Recommendation  string `json:"recommendation"`   // Brief advice
+	SleepQuality   string `json:"sleep_quality"`    // GOOD, OK, POOR, UNKNOWN
+	MorningLoad    string `json:"morning_load"`     // CLEAR, LIGHT, PACKED
+	RecoveryStatus string `json:"recovery_status"`  // GOOD, OK, POOR, UNKNOWN (based on HRV)
+	Recommendation string `json:"recommendation"`   // Brief advice
 }
 
 // Health ingest summary structure
@@ -126,8 +134,9 @@ func main() {
 		TargetDate:  today,
 	}
 
-	// 1. Get health data
+	// 1. Get health data (from health-ingest CLI and SQLite)
 	getHealthData(&briefing, today)
+	getHealthDataFromSQLite(&briefing, today)
 
 	// 2. Get calendar data (both personal and work)
 	getCalendarData(&briefing, today)
@@ -369,7 +378,7 @@ func getTrainingData(b *MorningBriefing, today string) {
 }
 
 func classify(b *MorningBriefing) {
-	// Sleep quality
+	// Sleep quality (factoring in deep sleep)
 	if !b.Sleep.DataAvailable || !b.Sleep.IsCurrentDay {
 		b.Classification.SleepQuality = "UNKNOWN"
 	} else if b.Sleep.TotalHours != nil {
@@ -381,6 +390,31 @@ func classify(b *MorningBriefing) {
 			b.Classification.SleepQuality = "OK"
 		default:
 			b.Classification.SleepQuality = "POOR"
+		}
+
+		// Downgrade sleep quality if deep sleep is insufficient (<1hr)
+		if b.Sleep.DeepHours != nil && *b.Sleep.DeepHours < 1.0 {
+			switch b.Classification.SleepQuality {
+			case "GOOD":
+				b.Classification.SleepQuality = "OK"
+			case "OK":
+				b.Classification.SleepQuality = "POOR"
+			}
+		}
+	}
+
+	// Recovery status based on HRV
+	if b.Vitals.HRV == nil {
+		b.Classification.RecoveryStatus = "UNKNOWN"
+	} else {
+		hrv := *b.Vitals.HRV
+		switch {
+		case hrv <= 20:
+			b.Classification.RecoveryStatus = "POOR"
+		case hrv < 40:
+			b.Classification.RecoveryStatus = "OK"
+		default:
+			b.Classification.RecoveryStatus = "GOOD"
 		}
 	}
 
@@ -395,9 +429,20 @@ func classify(b *MorningBriefing) {
 		b.Classification.MorningLoad = "PACKED"
 	}
 
-	// Generate recommendation
+	// Generate recommendation (now includes recovery status)
 	sleep := b.Classification.SleepQuality
 	load := b.Classification.MorningLoad
+	recovery := b.Classification.RecoveryStatus
+
+	// Poor recovery takes priority in recommendations
+	if recovery == "POOR" && b.Vitals.HRV != nil {
+		if sleep == "POOR" {
+			b.Classification.Recommendation = "Poor sleep + poor recovery (low HRV). Take it very easy today, prioritize rest and recovery."
+		} else {
+			b.Classification.Recommendation = fmt.Sprintf("HRV is low (%.0fms) indicating poor recovery. Consider lighter activity today.", *b.Vitals.HRV)
+		}
+		return
+	}
 
 	switch {
 	case sleep == "POOR" && load == "PACKED":
@@ -418,4 +463,126 @@ func classify(b *MorningBriefing) {
 func yesterday(today string) string {
 	t, _ := time.Parse("2006-01-02", today)
 	return t.AddDate(0, 0, -1).Format("2006-01-02")
+}
+
+// SQLite database path
+func getHealthDBPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".health-ingest", "health.db")
+}
+
+// Query average HRV for a given date from SQLite
+func queryAverageHRV(db *sql.DB, date string) (*float64, error) {
+	query := `
+		SELECT AVG(value) FROM metrics 
+		WHERE metric_name = 'heart_rate_variability' 
+		AND timestamp LIKE ? || '%'
+	`
+	var avg sql.NullFloat64
+	err := db.QueryRow(query, date).Scan(&avg)
+	if err != nil {
+		return nil, err
+	}
+	if !avg.Valid {
+		return nil, nil
+	}
+	return &avg.Float64, nil
+}
+
+// Query sleep stages for a given date from SQLite
+func querySleepStages(db *sql.DB, date string) (deep, rem, core *float64, err error) {
+	query := `
+		SELECT metric_name, value FROM metrics 
+		WHERE metric_name IN ('sleep_deep', 'sleep_rem', 'sleep_core')
+		AND timestamp LIKE ? || '%'
+	`
+	rows, err := db.Query(query, date)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name string
+		var value float64
+		if err := rows.Scan(&name, &value); err != nil {
+			continue
+		}
+		v := value
+		switch name {
+		case "sleep_deep":
+			deep = &v
+		case "sleep_rem":
+			rem = &v
+		case "sleep_core":
+			core = &v
+		}
+	}
+	return deep, rem, core, nil
+}
+
+// Query latest respiratory rate for a given date from SQLite
+func queryLatestRespiratoryRate(db *sql.DB, date string) (*float64, error) {
+	query := `
+		SELECT value FROM metrics 
+		WHERE metric_name = 'respiratory_rate' 
+		AND timestamp LIKE ? || '%'
+		ORDER BY timestamp DESC 
+		LIMIT 1
+	`
+	var value sql.NullFloat64
+	err := db.QueryRow(query, date).Scan(&value)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !value.Valid {
+		return nil, nil
+	}
+	return &value.Float64, nil
+}
+
+// Fetch additional metrics from SQLite database
+func getHealthDataFromSQLite(b *MorningBriefing, today string) {
+	dbPath := getHealthDBPath()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		b.Errors = append(b.Errors, fmt.Sprintf("sqlite open error: %v", err))
+		return
+	}
+	defer db.Close()
+
+	// Get average HRV for today
+	avgHRV, err := queryAverageHRV(db, today)
+	if err != nil {
+		b.Errors = append(b.Errors, fmt.Sprintf("HRV query error: %v", err))
+	} else if avgHRV != nil {
+		b.Vitals.HRV = avgHRV
+	}
+
+	// Get sleep stages
+	deep, rem, core, err := querySleepStages(db, today)
+	if err != nil {
+		b.Errors = append(b.Errors, fmt.Sprintf("sleep stages query error: %v", err))
+	} else {
+		if deep != nil {
+			b.Sleep.DeepHours = deep
+		}
+		if rem != nil {
+			b.Sleep.REMHours = rem
+		}
+		if core != nil {
+			b.Sleep.CoreHours = core
+		}
+	}
+
+	// Get latest respiratory rate
+	rr, err := queryLatestRespiratoryRate(db, today)
+	if err != nil {
+		b.Errors = append(b.Errors, fmt.Sprintf("respiratory rate query error: %v", err))
+	} else if rr != nil {
+		b.Vitals.RespiratoryRate = rr
+	}
 }
