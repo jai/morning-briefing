@@ -1,0 +1,53 @@
+name: Release
+on:
+  push:
+    branches:
+      - main
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run tests
+        run: go test -v ./...
+
+      - name: Run Release Please
+        uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Build binary
+        if: steps.release.outputs.release_created
+        run: |
+          VERSION="${{ steps.release.outputs.tag_name }}"
+          GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o morning-briefing-linux-amd64 .
+          GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w" -o morning-briefing-darwin-arm64 .
+
+      - name: Upload release assets
+        if: steps.release.outputs.release_created
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.release.outputs.tag_name }}"
+          gh release upload "$TAG" morning-briefing-linux-amd64 morning-briefing-darwin-arm64 --clobber
+
+      - name: Output release information
+        if: steps.release.outputs.release_created
+        run: |
+          echo "Release created: ${{ steps.release.outputs.tag_name }}"
+          echo "Release URL: ${{ steps.release.outputs.html_url }}"
