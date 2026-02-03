@@ -1,4 +1,4 @@
-module github.com/jai/morning-briefing
+module github.com/jai/briefing
 
 go 1.24.0
 
