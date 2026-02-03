@@ -14,7 +14,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.JAI_CI_PERSONAL_ACCESS_TOKEN }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -29,7 +28,6 @@ jobs:
         uses: googleapis/release-please-action@v4
         id: release
         with:
-          token: ${{ secrets.JAI_CI_PERSONAL_ACCESS_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
@@ -43,7 +41,7 @@ jobs:
       - name: Upload release assets
         if: steps.release.outputs.release_created
         env:
-          GH_TOKEN: ${{ secrets.JAI_CI_PERSONAL_ACCESS_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ steps.release.outputs.tag_name }}"
           gh release upload "$TAG" morning-briefing-linux-amd64 morning-briefing-darwin-arm64 --clobber
