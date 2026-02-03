@@ -1,9 +1,14 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 // Test the yesterday() helper function
@@ -377,4 +382,300 @@ func findSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// ==================== NEW TESTS FOR SQLITE METRICS ====================
+
+// Test VitalsData includes new fields (HRV, RespiratoryRate)
+func TestVitalsDataStructure(t *testing.T) {
+	vitals := VitalsData{
+		RestingHR:       ptr(52.0),
+		HRV:             ptr(45.0),
+		SpO2:            ptr(98.0),
+		RespiratoryRate: ptr(12.5),
+	}
+
+	if vitals.RespiratoryRate == nil || *vitals.RespiratoryRate != 12.5 {
+		t.Errorf("RespiratoryRate = %v, want 12.5", vitals.RespiratoryRate)
+	}
+}
+
+// Test SleepData includes CoreHours
+func TestSleepDataStructure(t *testing.T) {
+	sleep := SleepData{
+		TotalHours:    ptr(7.5),
+		DeepHours:     ptr(1.2),
+		REMHours:      ptr(1.5),
+		CoreHours:     ptr(4.8),
+		DataAvailable: true,
+		IsCurrentDay:  true,
+	}
+
+	if sleep.CoreHours == nil || *sleep.CoreHours != 4.8 {
+		t.Errorf("CoreHours = %v, want 4.8", sleep.CoreHours)
+	}
+}
+
+// Test Classification includes RecoveryStatus
+func TestClassificationStructure(t *testing.T) {
+	c := Classification{
+		SleepQuality:   "GOOD",
+		MorningLoad:    "LIGHT",
+		RecoveryStatus: "GOOD",
+		Recommendation: "Well rested",
+	}
+
+	if c.RecoveryStatus != "GOOD" {
+		t.Errorf("RecoveryStatus = %q, want %q", c.RecoveryStatus, "GOOD")
+	}
+}
+
+// Test SQLite metric querying with test database
+func TestQuerySQLiteMetrics(t *testing.T) {
+	// Create temp database
+	tmpDir, err := os.MkdirTemp("", "health-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "health.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Create schema
+	_, err = db.Exec(`
+		CREATE TABLE metrics (
+			id INTEGER PRIMARY KEY,
+			file_date DATE,
+			metric_name TEXT,
+			timestamp TEXT,
+			value REAL,
+			unit TEXT,
+			source TEXT,
+			raw_json TEXT,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(metric_name, timestamp)
+		)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert test data - today's date
+	today := time.Now().Format("2006-01-02")
+	todayTimestamp := today + " 00:00:00 +0700"
+	_, err = db.Exec(`
+		INSERT INTO metrics (metric_name, timestamp, value, unit) VALUES
+		('heart_rate_variability', ?, 45.5, 'ms'),
+		('heart_rate_variability', ?, 50.2, 'ms'),
+		('sleep_deep', ?, 1.2, 'hr'),
+		('sleep_rem', ?, 1.5, 'hr'),
+		('sleep_core', ?, 4.8, 'hr'),
+		('respiratory_rate', ?, 12.0, 'count/min')
+	`, today+" 06:00:00 +0700", today+" 05:00:00 +0700",
+		todayTimestamp, todayTimestamp, todayTimestamp, today+" 05:30:00 +0700")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Test querying average HRV
+	avgHRV, err := queryAverageHRV(db, today)
+	if err != nil {
+		t.Errorf("queryAverageHRV error: %v", err)
+	}
+	if avgHRV == nil {
+		t.Error("queryAverageHRV returned nil, expected value")
+	} else if *avgHRV < 47 || *avgHRV > 48 {
+		t.Errorf("queryAverageHRV = %v, want ~47.85", *avgHRV)
+	}
+
+	// Test querying sleep stages
+	deep, rem, core, err := querySleepStages(db, today)
+	if err != nil {
+		t.Errorf("querySleepStages error: %v", err)
+	}
+	if deep == nil || *deep != 1.2 {
+		t.Errorf("deep = %v, want 1.2", deep)
+	}
+	if rem == nil || *rem != 1.5 {
+		t.Errorf("rem = %v, want 1.5", rem)
+	}
+	if core == nil || *core != 4.8 {
+		t.Errorf("core = %v, want 4.8", core)
+	}
+
+	// Test querying latest respiratory rate
+	rr, err := queryLatestRespiratoryRate(db, today)
+	if err != nil {
+		t.Errorf("queryLatestRespiratoryRate error: %v", err)
+	}
+	if rr == nil || *rr != 12.0 {
+		t.Errorf("respiratory_rate = %v, want 12.0", rr)
+	}
+}
+
+// Test HRV-based recovery classification
+func TestClassifyRecoveryStatus(t *testing.T) {
+	tests := []struct {
+		name     string
+		hrv      *float64
+		expected string
+	}{
+		{"no HRV data", nil, "UNKNOWN"},
+		{"very low HRV (poor recovery)", ptr(15.0), "POOR"},
+		{"low HRV boundary", ptr(20.0), "POOR"},
+		{"moderate HRV", ptr(35.0), "OK"},
+		{"good HRV", ptr(50.0), "GOOD"},
+		{"excellent HRV", ptr(80.0), "GOOD"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &MorningBriefing{
+				Vitals: VitalsData{HRV: tt.hrv},
+				Sleep:  SleepData{DataAvailable: false},
+			}
+			classify(b)
+			if b.Classification.RecoveryStatus != tt.expected {
+				t.Errorf("RecoveryStatus = %q, want %q", b.Classification.RecoveryStatus, tt.expected)
+			}
+		})
+	}
+}
+
+// Test sleep classification with deep sleep factor
+func TestClassifySleepWithDeepSleep(t *testing.T) {
+	tests := []struct {
+		name         string
+		totalHours   *float64
+		deepHours    *float64
+		isCurrentDay bool
+		expected     string
+	}{
+		{"good total, good deep", ptr(7.5), ptr(1.5), true, "GOOD"},
+		{"good total, low deep", ptr(7.5), ptr(0.5), true, "OK"}, // Downgraded due to low deep
+		{"good total, very low deep", ptr(7.5), ptr(0.3), true, "OK"},
+		{"ok total, good deep", ptr(6.0), ptr(1.2), true, "OK"},
+		{"ok total, low deep", ptr(6.0), ptr(0.5), true, "POOR"}, // Downgraded due to low deep
+		{"poor total, any deep", ptr(4.0), ptr(1.5), true, "POOR"},
+		{"no deep data", ptr(7.5), nil, true, "GOOD"}, // Falls back to total-only
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &MorningBriefing{
+				Sleep: SleepData{
+					TotalHours:    tt.totalHours,
+					DeepHours:     tt.deepHours,
+					DataAvailable: true,
+					IsCurrentDay:  tt.isCurrentDay,
+				},
+			}
+			classify(b)
+			if b.Classification.SleepQuality != tt.expected {
+				t.Errorf("SleepQuality = %q, want %q", b.Classification.SleepQuality, tt.expected)
+			}
+		})
+	}
+}
+
+// Test combined recommendation with recovery status
+func TestClassifyRecommendationsWithRecovery(t *testing.T) {
+	tests := []struct {
+		name         string
+		sleepHours   *float64
+		deepHours    *float64
+		hrv          *float64
+		morningCount int
+		wantContains string
+	}{
+		{
+			"poor recovery poor sleep",
+			ptr(4.0), ptr(0.5), ptr(15.0), 3,
+			"recovery",
+		},
+		{
+			"good sleep poor recovery",
+			ptr(8.0), ptr(1.5), ptr(18.0), 1,
+			"HRV",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events := make([]CalendarEvent, tt.morningCount)
+			for i := range events {
+				events[i] = CalendarEvent{Time: "09:00", Summary: "Test"}
+			}
+
+			b := &MorningBriefing{
+				Sleep: SleepData{
+					TotalHours:    tt.sleepHours,
+					DeepHours:     tt.deepHours,
+					DataAvailable: true,
+					IsCurrentDay:  true,
+				},
+				Vitals: VitalsData{HRV: tt.hrv},
+				Calendar: CalendarData{
+					MorningEvents: events,
+					MorningCount:  tt.morningCount,
+				},
+			}
+			classify(b)
+			if !contains(b.Classification.Recommendation, tt.wantContains) {
+				t.Errorf("Recommendation = %q, want to contain %q", b.Classification.Recommendation, tt.wantContains)
+			}
+		})
+	}
+}
+
+// Test JSON output includes all new fields
+func TestMorningBriefingJSONOutputWithNewFields(t *testing.T) {
+	b := MorningBriefing{
+		GeneratedAt: time.Now().Format(time.RFC3339),
+		TargetDate:  time.Now().Format("2006-01-02"),
+		Sleep: SleepData{
+			TotalHours:    ptr(7.5),
+			DeepHours:     ptr(1.2),
+			REMHours:      ptr(1.5),
+			CoreHours:     ptr(4.8),
+			DataAvailable: true,
+			IsCurrentDay:  true,
+		},
+		Vitals: VitalsData{
+			RestingHR:       ptr(52.0),
+			HRV:             ptr(45.0),
+			SpO2:            ptr(98.0),
+			RespiratoryRate: ptr(12.5),
+		},
+		Classification: Classification{
+			SleepQuality:   "GOOD",
+			MorningLoad:    "LIGHT",
+			RecoveryStatus: "GOOD",
+			Recommendation: "Well rested",
+		},
+	}
+
+	output, err := json.MarshalIndent(b, "", "  ")
+	if err != nil {
+		t.Fatalf("Failed to marshal: %v", err)
+	}
+
+	// Verify all new fields are present in JSON
+	outputStr := string(output)
+	expectedFields := []string{
+		`"core_hours"`,
+		`"respiratory_rate"`,
+		`"recovery_status"`,
+	}
+
+	for _, field := range expectedFields {
+		if !contains(outputStr, field) {
+			t.Errorf("JSON output missing field %s", field)
+		}
+	}
 }
